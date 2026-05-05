@@ -1,182 +1,215 @@
-use crate::quiche::data::{ReadHalf, WriteHalf};
 use crate::quiche::driver::StreamQuicDriver;
-use crate::quiche::stream::{
-    AcceptedRemoteStream, BiDirectionalQuicheStream, WriteableQuicheStream,
-};
 use bytes::Bytes;
-use futures::stream::FuturesUnordered;
-use futures::StreamExt;
-use std::collections::HashMap;
+use ext_php_rs::types::Zval;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::sync::{mpsc, Notify};
 
-/// General data type for a quiche known types
 pub type StreamId = u64;
 pub type StreamData = Option<Bytes>;
 pub type StreamFin = bool;
-pub type StreamClosed = bool;
 
-/// Common data type for stream data with stream id, optional data bytes, and fin flag
+/// Outbound chunk: the PHP layer sends these into the per-connection write
+/// channel; the driver pulls them off in `process_writes`.
 pub type StreamWriter = (StreamId, StreamData, StreamFin);
-pub type StreamReader = (StreamData, StreamFin, StreamClosed);
 
-/// Map of stream id => multi-producer sender queue
-pub type StreamRoutes = HashMap<StreamId, mpsc::Sender<StreamReader>>;
+/// Stream priority command: (stream_id, urgency 0..=7, incremental).
+/// PHP enqueues these via `setPriority`; the driver applies them via
+/// `Connection::stream_priority` at the top of `process_writes`.
+pub type StreamPriority = (StreamId, u8, bool);
 
-/// Map of connection id => stream routes guarded by a mutex and ref-counted
-pub type ConnectionMap = Arc<Mutex<StreamRoutes>>;
+/// A single PHP-callable slot. `None` until PHP registers a callback.
+pub type CallbackSlot = Arc<parking_lot::Mutex<Option<Zval>>>;
 
-/// Per-connection handle retained by the server.
-///
-/// New stream notifications are aggregated at the connection level via the shared
-/// `new_stream_tx` channel, so this handle only needs to keep the writing path
-/// and stream-routing table alive and to provide server-initiated stream opening.
-#[derive(Debug)]
-pub struct QuicheConnection {
-    /// The unique connection ID of the current connection state.
-    conn_id: u64,
-    /// The remote address of this connection's peer.
-    peer_addr: SocketAddr,
-
-    stream_event_send: mpsc::Sender<StreamWriter>,
-    stream_event_send_notify: Arc<Notify>,
-    connections: ConnectionMap,
-
-    stream_create_recv: mpsc::Receiver<AcceptedRemoteStream>,
-
-    /// All currently open streams accepted from any connection.
-    active_streams: Vec<AcceptedRemoteStream>,
+/// Per-stream callback slots. Each stream has its own pair so PHP can hook
+/// data delivery and disconnect notification independently.
+pub struct StreamSlots {
+    pub on_data: CallbackSlot,
+    pub on_close: CallbackSlot,
 }
 
-impl QuicheConnection {
-    pub(crate) const STREAM_BUFFER_SIZE: usize = 65_536;
+/// Map of stream_id → callback slots. Owned by the server (PHP thread);
+/// a clone lives on each `ConnOpenHandle` so PHP stream objects can
+/// register their own slot when opening server-initiated streams.
+pub type PhpStreamCallbacks =
+    Arc<parking_lot::Mutex<HashMap<StreamId, StreamSlots>>>;
 
-    /// Build a connection handle and its paired driver.
+pub(crate) const STREAM_BUFFER_SIZE: usize = 65_536;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DriverEvent — emitted by every driver into the server's shared event channel
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Events emitted by `StreamQuicDriver` into the server's shared event mpsc.
+///
+/// Decoupling the driver from the server means we no longer need a per-tick
+/// `FuturesUnordered` over connections: each driver wakes the server only
+/// when it has work, and idle connections cost zero CPU.
+#[derive(Debug)]
+pub enum DriverEvent {
+    /// The remote peer opened a new bidirectional stream.
+    NewBidi(StreamId),
+    /// The remote peer opened a new unidirectional stream.
+    NewUni(StreamId),
+    /// A data chunk arrived on `stream_id`.
+    Data {
+        stream_id: StreamId,
+        data: Bytes,
+        fin: bool,
+    },
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ConnOpenHandle — clonable handle held by PHP stream objects
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Lightweight handle cloned into PHP stream objects so they can open new
+/// streams on the same connection without retaining the full `ConnState`.
+///
+/// The `php_stream_callbacks` field wraps `Zval` (`!Send`); the handle is
+/// only ever accessed from the PHP thread, so this is sound.
+#[derive(Clone)]
+pub struct ConnOpenHandle {
+    pub conn_id: u64,
+    pub peer_addr: SocketAddr,
+    pub(crate) write_tx: mpsc::Sender<StreamWriter>,
+    pub(crate) write_notify: Arc<Notify>,
+    pub(crate) priority_tx: mpsc::Sender<StreamPriority>,
+    pub(crate) php_stream_callbacks: PhpStreamCallbacks,
+}
+
+impl ConnOpenHandle {
+    /// Register slots for a server-initiated bidirectional stream.
     ///
-    /// * `new_stream_tx` / `closed_stream_tx` are server-wide channels so that
-    ///   all connections funnel their stream events into a single
-    ///   `tokio::select!` in [`QuicheServerSocket::tick`].
-    /// * `peer_addr` is the remote address of the peer and is embedded in every
-    ///   stream opened through this connection.
-    pub fn build(conn_id: u64, peer_addr: SocketAddr) -> (Self, StreamQuicDriver) {
-        let (stream_event_send, stream_event_recv) = mpsc::channel(128);
-        let (stream_create_send, stream_create_recv) = mpsc::channel(16);
+    /// No async wiring is needed: when the peer responds on this stream the
+    /// driver will route the data through the shared event channel, and the
+    /// dispatcher uses `php_stream_callbacks[stream_id]` to find the slots.
+    pub fn prepare_bidi_stream(
+        &self,
+        stream_id: StreamId,
+    ) -> (
+        mpsc::Sender<StreamWriter>,
+        Arc<Notify>,
+        CallbackSlot,
+        CallbackSlot,
+        mpsc::Sender<StreamPriority>,
+    ) {
+        let (on_data, on_close) = make_slot_pair();
+        self.php_stream_callbacks.lock().insert(
+            stream_id,
+            StreamSlots {
+                on_data: on_data.clone(),
+                on_close: on_close.clone(),
+            },
+        );
+        (
+            self.write_tx.clone(),
+            self.write_notify.clone(),
+            on_data,
+            on_close,
+            self.priority_tx.clone(),
+        )
+    }
 
+    /// Register slots for a server-initiated unidirectional stream. The
+    /// `on_data` slot is allocated for uniformity but never invoked (the
+    /// peer cannot send data back on a server-initiated uni stream).
+    pub fn prepare_uni_stream(
+        &self,
+        stream_id: StreamId,
+    ) -> (
+        mpsc::Sender<StreamWriter>,
+        Arc<Notify>,
+        CallbackSlot,
+        mpsc::Sender<StreamPriority>,
+    ) {
+        let (on_data, on_close) = make_slot_pair();
+        self.php_stream_callbacks.lock().insert(
+            stream_id,
+            StreamSlots {
+                on_data,
+                on_close: on_close.clone(),
+            },
+        );
+        (
+            self.write_tx.clone(),
+            self.write_notify.clone(),
+            on_close,
+            self.priority_tx.clone(),
+        )
+    }
+}
+
+#[allow(clippy::arc_with_non_send_sync)]
+pub fn make_slot_pair() -> (CallbackSlot, CallbackSlot) {
+    (
+        Arc::new(parking_lot::Mutex::new(None)),
+        Arc::new(parking_lot::Mutex::new(None)),
+    )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ConnState — per-connection record retained by the server
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Server-side per-connection record. There is no per-connection task or
+/// `tick()` anymore — the driver pumps events into a shared channel and the
+/// server's main loop dispatches them.
+pub struct ConnState {
+    pub peer_addr: SocketAddr,
+    pub php_stream_callbacks: PhpStreamCallbacks,
+    pub open_handle: ConnOpenHandle,
+}
+
+impl ConnState {
+    /// Build the per-connection record + its driver, wired to the shared
+    /// `server_event_tx` so reads route directly into the server.
+    ///
+    /// `conn_close_tx` carries terminal close signals on a separate small
+    /// channel so a saturated event channel can never lose a close event.
+    pub fn build(
+        conn_id: u64,
+        peer_addr: SocketAddr,
+        server_event_tx: mpsc::Sender<(u64, DriverEvent)>,
+        conn_close_tx: mpsc::Sender<(u64, bool)>,
+    ) -> (Self, StreamQuicDriver) {
+        let (write_tx, stream_event_recv) = mpsc::channel(256);
+        let (priority_tx, priority_recv) = mpsc::channel(64);
         let write_notify = Arc::new(Notify::new());
-        let connections: ConnectionMap = Arc::new(Mutex::new(HashMap::new()));
+
+        #[allow(clippy::arc_with_non_send_sync)]
+        let php_stream_callbacks: PhpStreamCallbacks =
+            Arc::new(parking_lot::Mutex::new(HashMap::new()));
+
+        let open_handle = ConnOpenHandle {
+            conn_id,
+            peer_addr,
+            write_tx: write_tx.clone(),
+            write_notify: write_notify.clone(),
+            priority_tx,
+            php_stream_callbacks: php_stream_callbacks.clone(),
+        };
 
         let driver = StreamQuicDriver {
             conn_id,
             stream_event_recv,
-            new_stream_tx: stream_create_send.clone(),
-            connections: connections.clone(),
-            stream_event_send: stream_event_send.clone(),
+            priority_recv,
+            event_tx: server_event_tx,
             write_notify: write_notify.clone(),
             established: false,
-            io_worker_buf: vec![0u8; QuicheConnection::STREAM_BUFFER_SIZE],
-            peer_addr,
+            io_worker_buf: vec![0u8; STREAM_BUFFER_SIZE],
+            pending_writes: HashMap::new(),
+            seen_streams: HashSet::new(),
+            conn_close_tx,
         };
 
-        let handle = Self {
-            conn_id,
+        let state = Self {
             peer_addr,
-            stream_event_send,
-            stream_event_send_notify: write_notify,
-            connections,
-            stream_create_recv,
-            active_streams: Vec::new(),
+            php_stream_callbacks,
+            open_handle,
         };
 
-        (handle, driver)
-    }
-
-    /// Open a **bidirectional** stream (both sides can read and write).
-    ///
-    /// Use IDs matching your role:
-    /// - server-initiated: 1, 5, 9, …
-    /// - client-initiated: 0, 4, 8, …
-    pub fn open_bidi_stream(&self, stream_id: u64) -> BiDirectionalQuicheStream {
-        let (read_tx, read_rx) = mpsc::channel(256);
-        let mut connections = self.connections.lock().unwrap();
-        connections.insert(stream_id, read_tx);
-        BiDirectionalQuicheStream {
-            read: ReadHalf {
-                stream_id,
-                read_rx,
-                conn_id: self.conn_id,
-                peer_addr: self.peer_addr,
-            },
-            write: WriteHalf {
-                stream_id,
-                conn_id: self.conn_id,
-                peer_addr: self.peer_addr,
-                write_tx: self.stream_event_send.clone(),
-                write_notify: self.stream_event_send_notify.clone(),
-            },
-        }
-    }
-
-    /// Open a **unidirectional** stream — you write, the remote reads.
-    ///
-    /// Use IDs matching your role:
-    /// - server-initiated uni: 3, 7, 11, …
-    /// - client-initiated uni: 2, 6, 10, …
-    pub fn open_uni_stream(&self, stream_id: u64) -> WriteableQuicheStream {
-        WriteableQuicheStream {
-            inner: WriteHalf {
-                stream_id,
-                conn_id: self.conn_id,
-                peer_addr: self.peer_addr,
-                write_tx: self.stream_event_send.clone(),
-                write_notify: self.stream_event_send_notify.clone(),
-            },
-        }
-    }
-
-    pub async fn tick(&mut self) -> (u64, bool) {
-        let mut closed = false;
-
-        tokio::select! {
-            Some(stream) = self.stream_create_recv.recv() => {
-                self.active_streams.push(stream);
-
-                // TODO: process new streams
-            },
-            Some(Some(event)) = async {
-                let mut fut = FuturesUnordered::new();
-                for stream in &mut self.active_streams {
-                    fut.push(stream.read());
-                }
-
-                if !fut.is_empty() {
-                    fut.next().await
-                } else {
-                    std::future::pending::<()>().await;
-                    None
-                }
-            } => {
-                log::info!("[{:?}] Stream data received — {event}", self.conn_id);
-
-                if event.fin {
-                    self.active_streams.retain(|s| s.stream_id() != event.stream_id);
-
-                    log::info!(
-                        "[{:?}] Stream {:?} closed, removing from tracked list, left = {:?}",
-                        self.conn_id,
-                        event.stream_id,
-                        self.active_streams.len()
-                    );
-
-                    if event.closed {
-                        closed = true;
-                    }
-                } else {
-                    // TODO: process stream writes - push into a closure maybe?
-                }
-            }
-        }
-
-        (self.conn_id, closed)
+        (state, driver)
     }
 }

@@ -951,8 +951,10 @@ dependencies = [
  "env_logger",
  "ext-php-rs",
  "futures",
+ "gettid",
  "libc",
  "log",
+ "parking_lot",
  "rcgen",
  "tempfile",
  "thiserror 2.0.18",
@@ -1286,6 +1288,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "gettid"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "96d9ea5ee7dc59a2244fa486d8f00472f8d3e4c8c5f7f24a8551559ef3f3530e"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

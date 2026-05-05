@@ -3,7 +3,10 @@ use crate::quiche::error::QuicheError;
 use crate::quiche::runtime::get_runtime;
 use crate::quiche::socket::QuicheServerSocketImpl;
 use ext_php_rs::prelude::*;
+use ext_php_rs::types::Zval;
+use parking_lot::Mutex;
 use std::os::fd::{FromRawFd, RawFd};
+use std::sync::Arc;
 use tokio_eventfd::EventFd;
 
 #[php_class]
@@ -15,22 +18,59 @@ pub struct QuicheServerSocket {
 
 #[php_impl]
 impl QuicheServerSocket {
+    // PHP signature:
+    // public function __construct(array $sockets, Config $config, int $event_fd_id = -1, callable $on_stream)
     pub fn __construct(
         sockets: Vec<&SocketAddress>,
         config: &Config,
         event_fd_id: i32,
+        on_stream: &Zval,
     ) -> PhpResult<Self> {
+        if !on_stream.is_callable() {
+            return Err(PhpException::default(
+                "__construct expects a callable for $on_stream".into(),
+            ));
+        }
+
         let rt = get_runtime().map_err(PhpException::from)?;
 
+        // Zval is !Send, but Arc<Mutex<>> lets us share across the PHP object boundary.
+        // The callable is ONLY invoked on the PHP thread (inside block_on).
+        #[allow(clippy::arc_with_non_send_sync)]
+        let cb = Arc::new(Mutex::new(Some(on_stream.shallow_clone())));
+
         let addrs: Vec<String> = sockets.iter().map(|s| s.get_address_result()).collect();
-        let (server, event_fd) = rt.block_on(async move {
+        let (server, event_fd) = rt.block_on(async {
             let addr_strs: Vec<&str> = addrs.iter().map(String::as_str).collect();
-            let server = QuicheServerSocketImpl::bind(&addr_strs, config).await;
+            let server = QuicheServerSocketImpl::bind(&addr_strs, config, cb).await;
             let event_fd: Option<EventFd> = if event_fd_id != -1 {
-                // This is unsafe because we do not control the lifecycle of this raw fd, and since this is controlled
-                // by the PHP thread, we cannot guarantee that the fd is valid. The developer is responsible for ensuring
-                // that the fd is valid and is not closed by the time we try to use it.
-                Some(unsafe { EventFd::from_raw_fd(event_fd_id as RawFd) })
+                // Duplicate the caller's fd so this object owns an independent
+                // fd that refers to the same underlying eventfd. That gives
+                // PHP main a clean ownership story:
+                //
+                //   * Main owns the original fd it created with
+                //     network_eventfd_create(); it can close that fd at any
+                //     time (after joining the worker is the safest order).
+                //   * The worker thread's QuicheServerSocket owns the dup;
+                //     close() / Drop closes the dup.
+                //
+                // Both fds are independent file table entries that share
+                // the same kernel eventfd object (refcounted), so a write
+                // on either is visible to a read on the other.
+                let dup_fd = unsafe { libc::dup(event_fd_id as RawFd) };
+                if dup_fd < 0 {
+                    let e = std::io::Error::last_os_error();
+                    log::error!("dup(eventfd) failed: {e}");
+                    None
+                } else {
+                    log::info!(
+                        "QuicheServerSocket: duplicated eventfd {} → {} (worker owns dup)",
+                        event_fd_id, dup_fd
+                    );
+                    // SAFETY: dup_fd is freshly allocated by libc::dup and
+                    // owned solely by this EventFd from here on.
+                    Some(unsafe { EventFd::from_raw_fd(dup_fd) })
+                }
             } else {
                 None
             };
@@ -38,35 +78,50 @@ impl QuicheServerSocket {
         });
 
         Ok(Self {
-            inner: server.map_err(QuicheError::RuntimeInit)?,
             event_fd,
+            inner: server.map_err(QuicheError::RuntimeInit)?,
         })
     }
 
     /// Drive one iteration of the event loop.
     ///
-    /// Internally runs a `tokio::select!` across: new and existing connections
-    /// alongside the optional EventFd timer.
+    /// Internally runs a `tokio::select!` across new and existing connections
+    /// plus the optional EventFd timer.  Returns when the timer fires (or when
+    /// `event_fd_id == -1` and a channel arm is exhausted).
     pub fn tick(&mut self) -> PhpResult<()> {
         let rt = get_runtime().map_err(PhpException::from)?;
 
-        // Split borrows explicitly so the borrow checker can see that
-        // `inner` and `event_fd` are independent fields.
+        log::debug!(
+            "PHP tick() called on thread={:?} pid={} tid={} (eventfd={})",
+            std::thread::current().id(),
+            std::process::id(),
+            gettid::gettid(),
+            self.event_fd.is_some()
+        );
+
         let (inner, event_fd) = (&mut self.inner, &mut self.event_fd);
         rt.block_on(inner.tick(event_fd.as_mut()));
 
+        log::info!("PHP tick() returning to caller");
         Ok(())
     }
 
     /// Shut down the server and release all resources.
     pub fn close(&mut self) {
+        log::info!("PHP close() invoked");
         self.inner.close();
+        // Dropping the EventFd here closes the underlying file descriptor
+        // exactly once. Callers must NOT call libc::close() on the fd
+        // separately — that would race the worker thread's last poll and
+        // cause it to miss the wake-up.
+        self.event_fd.take();
+        log::info!("PHP close() returned");
     }
 }
 
 /// An implementation of a QUIC socket address.
 ///
-/// Initialized before instantiation of the Quiche socket
+/// Initialized before instantiation of the Quiche socket.
 #[php_class]
 #[php(name = "NetherGames\\Quiche\\SocketAddress")]
 pub struct SocketAddress {
@@ -110,8 +165,10 @@ impl SocketAddress {
 mod tests {
     use crate::config::Config;
     use crate::quiche::socket::QuicheServerSocketImpl;
+    use parking_lot::Mutex;
     use rcgen::CertifiedKey;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use tokio_quiche::settings::QuicSettings;
 
     struct TestCerts {
@@ -155,10 +212,11 @@ mod tests {
         };
         let addr_strs = vec!["127.0.0.1:19132"];
 
-        // Tick the server socket.
-        let mut server = QuicheServerSocketImpl::bind(&addr_strs, &config)
-            .await
-            .unwrap();
+        #[allow(clippy::arc_with_non_send_sync)]
+        let mut server =
+            QuicheServerSocketImpl::bind(&addr_strs, &config, Arc::new(Mutex::new(None)))
+                .await
+                .unwrap();
 
         loop {
             server.tick(None).await;
