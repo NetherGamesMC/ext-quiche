@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use crate::quiche::conn::{DriverEvent, StreamPriority, StreamWriter};
+use crate::quiche::conn::{DriverEvent, StreamWriter};
 use bytes::Bytes;
 use tokio::sync::{mpsc, Notify};
 use tokio_quiche::metrics::Metrics;
@@ -22,11 +22,6 @@ pub struct StreamQuicDriver {
 
     /// Outbound chunks pushed by PHP via the per-connection write channel.
     pub stream_event_recv: mpsc::Receiver<StreamWriter>,
-
-    /// Stream priority commands pushed by PHP via `setPriority`. Drained at
-    /// the top of `process_writes` so a priority change applies before the
-    /// pending writes for the same stream are flushed.
-    pub priority_recv: mpsc::Receiver<StreamPriority>,
 
     /// Shared event channel into the server. Tagged with `conn_id` so the
     /// server can find the right `ConnState` without per-connection routing.
@@ -135,21 +130,6 @@ impl ApplicationOverQuic for StreamQuicDriver {
 
     fn process_writes(&mut self, conn: &mut QuicheConnection) -> QuicResult<()> {
         let conn_id = self.conn_id;
-
-        // Apply any pending priority changes first so they take effect for
-        // the writes in this same pass.
-        while let Ok((stream_id, urgency, incremental)) = self.priority_recv.try_recv() {
-            match conn.stream_priority(stream_id, urgency, incremental) {
-                Ok(()) => log::debug!(
-                    "[{conn_id}] stream {stream_id} priority urgency={urgency} \
-                     incremental={incremental}"
-                ),
-                Err(e) => log::warn!(
-                    "[{conn_id}] stream_priority({stream_id}, {urgency}, {incremental}) \
-                     failed: {e:?}"
-                ),
-            }
-        }
 
         // Drain new chunks from PHP into per-stream queues first so we can
         // attempt them in the same pass.

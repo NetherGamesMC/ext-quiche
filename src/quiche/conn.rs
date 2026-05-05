@@ -14,11 +14,6 @@ pub type StreamFin = bool;
 /// channel; the driver pulls them off in `process_writes`.
 pub type StreamWriter = (StreamId, StreamData, StreamFin);
 
-/// Stream priority command: (stream_id, urgency 0..=7, incremental).
-/// PHP enqueues these via `setPriority`; the driver applies them via
-/// `Connection::stream_priority` at the top of `process_writes`.
-pub type StreamPriority = (StreamId, u8, bool);
-
 /// A single PHP-callable slot. `None` until PHP registers a callback.
 pub type CallbackSlot = Arc<parking_lot::Mutex<Option<Zval>>>;
 
@@ -75,7 +70,6 @@ pub struct ConnOpenHandle {
     pub peer_addr: SocketAddr,
     pub(crate) write_tx: mpsc::Sender<StreamWriter>,
     pub(crate) write_notify: Arc<Notify>,
-    pub(crate) priority_tx: mpsc::Sender<StreamPriority>,
     pub(crate) php_stream_callbacks: PhpStreamCallbacks,
 }
 
@@ -93,7 +87,6 @@ impl ConnOpenHandle {
         Arc<Notify>,
         CallbackSlot,
         CallbackSlot,
-        mpsc::Sender<StreamPriority>,
     ) {
         let (on_data, on_close) = make_slot_pair();
         self.php_stream_callbacks.lock().insert(
@@ -108,7 +101,6 @@ impl ConnOpenHandle {
             self.write_notify.clone(),
             on_data,
             on_close,
-            self.priority_tx.clone(),
         )
     }
 
@@ -118,12 +110,7 @@ impl ConnOpenHandle {
     pub fn prepare_uni_stream(
         &self,
         stream_id: StreamId,
-    ) -> (
-        mpsc::Sender<StreamWriter>,
-        Arc<Notify>,
-        CallbackSlot,
-        mpsc::Sender<StreamPriority>,
-    ) {
+    ) -> (mpsc::Sender<StreamWriter>, Arc<Notify>, CallbackSlot) {
         let (on_data, on_close) = make_slot_pair();
         self.php_stream_callbacks.lock().insert(
             stream_id,
@@ -132,12 +119,7 @@ impl ConnOpenHandle {
                 on_close: on_close.clone(),
             },
         );
-        (
-            self.write_tx.clone(),
-            self.write_notify.clone(),
-            on_close,
-            self.priority_tx.clone(),
-        )
+        (self.write_tx.clone(), self.write_notify.clone(), on_close)
     }
 }
 
@@ -175,7 +157,6 @@ impl ConnState {
         conn_close_tx: mpsc::Sender<(u64, bool)>,
     ) -> (Self, StreamQuicDriver) {
         let (write_tx, stream_event_recv) = mpsc::channel(256);
-        let (priority_tx, priority_recv) = mpsc::channel(64);
         let write_notify = Arc::new(Notify::new());
 
         #[allow(clippy::arc_with_non_send_sync)]
@@ -187,14 +168,12 @@ impl ConnState {
             peer_addr,
             write_tx: write_tx.clone(),
             write_notify: write_notify.clone(),
-            priority_tx,
             php_stream_callbacks: php_stream_callbacks.clone(),
         };
 
         let driver = StreamQuicDriver {
             conn_id,
             stream_event_recv,
-            priority_recv,
             event_tx: server_event_tx,
             write_notify: write_notify.clone(),
             established: false,
