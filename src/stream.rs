@@ -63,8 +63,8 @@ impl IncomingBidiStream {
     ///
     /// Uses a non-blocking channel send so it is safe to call from inside the
     /// `setOnData` closure (which runs within the event loop tick).
-    pub fn write(&self, data: String, fin: bool) -> PhpResult<()> {
-        let bytes = bytes::Bytes::from(data.into_bytes());
+    pub fn write(&self, data: Vec<u8>, fin: bool) -> PhpResult<()> {
+        let bytes = bytes::Bytes::from(data);
         self.write_tx
             .try_send((self.stream_id, Some(bytes), fin))
             .map_err(|e| PhpException::default(format!("write failed: {e}")))?;
@@ -247,8 +247,8 @@ impl BidiStream {
     }
 
     /// Write `$data` to the client.  Set `$fin = true` to close the stream.
-    pub fn write(&self, data: String, fin: bool) -> PhpResult<()> {
-        let bytes = bytes::Bytes::from(data.into_bytes());
+    pub fn write(&self, data: Vec<u8>, fin: bool) -> PhpResult<()> {
+        let bytes = bytes::Bytes::from(data);
         self.write_tx
             .try_send((self.stream_id, Some(bytes), fin))
             .map_err(|e| PhpException::default(format!("write failed: {e}")))?;
@@ -302,8 +302,8 @@ impl UniStream {
     }
 
     /// Write `$data` to the client.  Set `$fin = true` to close the stream.
-    pub fn write(&self, data: String, fin: bool) -> PhpResult<()> {
-        let bytes = bytes::Bytes::from(data.into_bytes());
+    pub fn write(&self, data: Vec<u8>, fin: bool) -> PhpResult<()> {
+        let bytes = bytes::Bytes::from(data);
         self.write_tx
             .try_send((self.stream_id, Some(bytes), fin))
             .map_err(|e| PhpException::default(format!("write failed: {e}")))?;
