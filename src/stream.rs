@@ -1,4 +1,5 @@
 use crate::quiche::conn::{CallbackSlot, ConnOpenHandle, StreamWriter};
+use ext_php_rs::binary::Binary;
 use ext_php_rs::prelude::*;
 use ext_php_rs::types::Zval;
 use std::sync::Arc;
@@ -63,8 +64,8 @@ impl IncomingBidiStream {
     ///
     /// Uses a non-blocking channel send so it is safe to call from inside the
     /// `setOnData` closure (which runs within the event loop tick).
-    pub fn write(&self, data: Vec<u8>, fin: bool) -> PhpResult<()> {
-        let bytes = bytes::Bytes::from(data);
+    pub fn write(&self, data: Binary<u8>, fin: bool) -> PhpResult<()> {
+        let bytes = bytes::Bytes::copy_from_slice(&data);
         self.write_tx
             .try_send((self.stream_id, Some(bytes), fin))
             .map_err(|e| PhpException::default(format!("write failed: {e}")))?;
@@ -247,8 +248,8 @@ impl BidiStream {
     }
 
     /// Write `$data` to the client.  Set `$fin = true` to close the stream.
-    pub fn write(&self, data: Vec<u8>, fin: bool) -> PhpResult<()> {
-        let bytes = bytes::Bytes::from(data);
+    pub fn write(&self, data: Binary<u8>, fin: bool) -> PhpResult<()> {
+        let bytes = bytes::Bytes::copy_from_slice(&data);
         self.write_tx
             .try_send((self.stream_id, Some(bytes), fin))
             .map_err(|e| PhpException::default(format!("write failed: {e}")))?;
@@ -302,8 +303,8 @@ impl UniStream {
     }
 
     /// Write `$data` to the client.  Set `$fin = true` to close the stream.
-    pub fn write(&self, data: Vec<u8>, fin: bool) -> PhpResult<()> {
-        let bytes = bytes::Bytes::from(data);
+    pub fn write(&self, data: Binary<u8>, fin: bool) -> PhpResult<()> {
+        let bytes = bytes::Bytes::copy_from_slice(&data);
         self.write_tx
             .try_send((self.stream_id, Some(bytes), fin))
             .map_err(|e| PhpException::default(format!("write failed: {e}")))?;

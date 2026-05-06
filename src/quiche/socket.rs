@@ -319,7 +319,7 @@ impl QuicheServerSocketImpl {
                     if let Some(ref cb_zval) = *on_data
                         && let Ok(callable) = ZendCallable::new(cb_zval)
                     {
-                        let data_str = String::from_utf8_lossy(&data).to_string();
+                        let data_str: &str = unsafe { std::str::from_utf8_unchecked(&data) };
                         let _ = callable.try_call(vec![
                             &data_str as &dyn IntoZvalDyn,
                             &fin as &dyn IntoZvalDyn,
