@@ -7,6 +7,7 @@ use ext_php_rs::types::Zval;
 use parking_lot::Mutex;
 use std::os::fd::{FromRawFd, RawFd};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio_eventfd::EventFd;
 
 #[php_class]
@@ -27,8 +28,24 @@ impl QuicheServerSocket {
         on_stream: &Zval,
     ) -> PhpResult<Self> {
         if !on_stream.is_callable() {
-            return Err(PhpException::default(
-                "__construct expects a callable for $on_stream".into(),
+            let received_type = match on_stream.get_type() {
+                ext_php_rs::types::ZvalTypeFlags::Null => "null",
+                ext_php_rs::types::ZvalTypeFlags::Bool => "bool",
+                ext_php_rs::types::ZvalTypeFlags::Long => "int",
+                ext_php_rs::types::ZvalTypeFlags::Double => "float",
+                ext_php_rs::types::ZvalTypeFlags::String => "string",
+                ext_php_rs::types::ZvalTypeFlags::Array => "array",
+                ext_php_rs::types::ZvalTypeFlags::Object => "object",
+                ext_php_rs::types::ZvalTypeFlags::Resource => "resource",
+                _ => "unknown",
+            };
+
+            return Err(PhpException::custom(
+                "InvalidArgumentException",
+                format!(
+                    "The $on_stream argument must be a callable (function, closure, or invokable object). Received: {}",
+                    received_type
+                ),
             ));
         }
 
@@ -99,8 +116,18 @@ impl QuicheServerSocket {
             self.event_fd.is_some()
         );
 
+        let start = Instant::now();
+        
         let (inner, event_fd) = (&mut self.inner, &mut self.event_fd);
         rt.block_on(inner.tick(event_fd.as_mut()));
+
+        let duration = start.elapsed();
+        
+        if duration.as_millis() > 100 {
+            log::warn!("PHP tick() took {:?} (slow event loop detected)", duration);
+        } else {
+            log::debug!("PHP tick() completed in {:?}", duration);
+        }
 
         log::info!("PHP tick() returning to caller");
         Ok(())
@@ -110,11 +137,18 @@ impl QuicheServerSocket {
     pub fn close(&mut self) {
         log::info!("PHP close() invoked");
         self.inner.close();
-        // Dropping the EventFd here closes the underlying file descriptor
-        // exactly once. Callers must NOT call libc::close() on the fd
-        // separately — that would race the worker thread's last poll and
-        // cause it to miss the wake-up.
-        self.event_fd.take();
+        
+        if let Some(fd) = self.event_fd.take() {
+            // Dropping the EventFd here closes the underlying file descriptor
+            // exactly once. Callers must NOT call libc::close() on the fd
+            // separately — that would race the worker thread's last poll and
+            // cause it to miss the wake-up.
+            drop(fd);
+            log::info!("EventFd closed successfully");
+        } else {
+            log::warn!("PHP close() called on already closed socket (double close detected)");
+        }
+        
         log::info!("PHP close() returned");
     }
 }
